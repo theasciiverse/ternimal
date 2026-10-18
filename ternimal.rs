@@ -8,6 +8,7 @@
 // (https://gnu.org/licenses/gpl.html)
 
 use std::{env, process, thread};
+use std::io::{self, Write};
 use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
 use std::collections::{VecDeque, HashMap};
 use std::fmt::{Display};
@@ -22,6 +23,8 @@ const TWO_PI: f64 = 2.0 * PI;
 /// Prints its formatted arguments to standard error, then exits the program.
 macro_rules! exit {
     ($($arg:tt)*) => (
+        // Give the terminal back first (Asciiverse)
+        ::term::restore();
         // Red foreground color
         eprint!("\x1B[31m");
         eprint!($($arg)*);
@@ -103,163 +106,205 @@ fn main() {
     // Use 24-bit RGB terminal colors (`true`) or the 256-color palette (`false`)
     arg_var!(true_color, true);
 
-    // Dimensions of the arena, in blocks
-    arg_var!(width, 60, 1, 500);
-    arg_var!(height, 40, 1, 500);
-    if height % 2 != 0 {
-        exit!("Invalid height '{}': Height must be a multiple of 2.", height);
-    }
+    // Fill the whole terminal, on its alternate screen, and start again
+    // whenever its size changes (Asciiverse)
+    arg_var!(fit, false);
 
-    // Minimum and maximum length of the model, in blocks.
-    // The program will animate between the two for a "creeping" motion.
-    let length_range = unwrap_or_exit(arguments.value("length", Range::new(10.0, 20.0)));
-    if !(1.0 <= length_range.from && length_range.to <= 1000.0) {
-        exit!("Invalid length '{} to {}': Length must be between 1 and 1000.", length_range.from, length_range.to);
-    }
+    // Any key quits (Asciiverse)
+    term::start(fit);
 
-    // Coefficients of the function determining the model's thickness,
-    // in blocks.
-    //
-    // The function has the form
-    //
-    // ```
-    // f(o, t) = a + b * sin(PI * (c * o + d * t + e)) + ...
-    // ```
-    //
-    // where `o` is the offset (between `0` and `1`) from the head
-    // of the model to its tail, and `t` is the time in seconds
-    // since the program was started.
-    let coefficients = unwrap_or_exit(arguments.values("thickness", vec![4.0, 1.0, 3.5, 0.0, 0.0]));
-    if coefficients.len() % 4 != 1 {
-        exit!("Invalid thickness specification: There must be 1, or 5, or 9, ... coefficients; {} were supplied.",
-                coefficients.len());
-    }
-
-    let thickness = |offset: f64, time: f64| {
-        assert!(0.0 <= offset && offset <= 1.0);
-        let mut thickness = coefficients[0];
-        for i in 0..((coefficients.len() - 1) / 4) {
-            thickness += coefficients[4 * i + 1] * (
-                PI * (
-                    (coefficients[4 * i + 2] * offset) +
-                    (coefficients[4 * i + 3] * time) +
-                    coefficients[4 * i + 4]
-                )
-            ).sin();
-        }
-        thickness
-    };
-
-    // Calculate upper bound for value of thickness function
-    let mut max_thickness = coefficients[0];
-    for i in 0..((coefficients.len() - 1) / 4) {
-        max_thickness += coefficients[4 * i + 1].abs();
-    }
-    if !(0.5 <= max_thickness && max_thickness <= 1000.0) {
-        exit!("Invalid thickness specification: Maximum thickness is {}; must be between 0.5 and 1000.", max_thickness);
-    }
-
-    let max_padding = 0.8 * ((min!(width, height) as f64) / 2.0);
-    // Minimum distance between the path and the boundary of the arena, in blocks
-    arg_var!(padding, min!(max_thickness, max_padding), 0.0, max_padding);
-
-    let max_radius = 0.8 * (((min!(width, height) as f64) / 2.0) - padding);
-    // Minimum and maximum radius of the arcs comprising the path, in blocks
-    let radius_range = unwrap_or_exit(arguments.value("radius",
-            Range::new(min!(1.2 * max_thickness, max_radius), max_radius)));
-    if !(0.5 <= radius_range.from && radius_range.to <= max_radius) {
-        exit!("Invalid radius '{} to {}': For the configured width, height, and padding, \
-                radius must be between 0.5 and {}.", radius_range.from, radius_range.to, max_radius);
-    }
-
-    // The dimensions of the arena must be such that it is always possible
-    // to generate a new arc that is tangential to the last arc in the path
-    // and whose radius lies within the permitted range (see `Path` for details).
-    // In the worst case, an arc of the maximum permitted radius is placed
-    // at the center of the arena, minimizing the available space for the next arc,
-    // which must be at least the minimum radius specified above.
-    let min_size = (2.0 * radius_range.to) + (4.0 * radius_range.from) + (2.0 * padding);
-    if (width as f64) < min_size && (height as f64) < min_size {
-        exit!("Insufficient arena size for path generation: For the configured radius and padding, \
-                either width or height must be at least {}.", min_size);
-    }
-
-    let mut path = Path {
-        random: Random(seed),
-        x_range: Range::new(padding, (width as f64) - padding),
-        y_range: Range::new(padding, (height as f64) - padding),
-        radius_range,
-        start_position: 0.0,
-        arcs: VecDeque::new(),
-    };
-
-    let mut last_position = 0.0;
-    let mut path_range = Range::new(0.0, length_range.from);
-    let mut expand_path = true;
-
-    let start_time = Instant::now();
-
-    // Rendering loop
-    loop {
-        let time = seconds(start_time.elapsed());
-
-        let position = speed * time;
-
-        if length_range.to > length_range.from {
-            // "Creeping" motion
-            let mut delta = position - last_position;
-            last_position = position;
-
-            while delta > 0.0 {
-                let length = path_range.to - path_range.from;
-
-                let max_delta = if expand_path {
-                    length_range.to - length
-                } else {
-                    length - length_range.from
-                };
-
-                let actual_delta = min!(delta, max_delta);
-
-                if expand_path {
-                    path_range.to += actual_delta;
-                } else {
-                    path_range.from += actual_delta;
-                }
-
-                if delta >= max_delta {
-                    expand_path = !expand_path;
-                }
-
-                delta -= actual_delta;
-            }
+    'arena: loop {
+        // Dimensions of the arena, in blocks
+        let (width, height) = if fit {
+            term::arena()
         } else {
-            // Linear motion
-            path_range.from = position;
-            path_range.to = path_range.from + length_range.from;
+            arg_var!(width, 60, 1, 500);
+            arg_var!(height, 40, 1, 500);
+            (width, height)
+        };
+        if height % 2 != 0 {
+            exit!("Invalid height '{}': Height must be a multiple of 2.", height);
         }
 
-        let model = Model::new(
-            path.generate(path_range.from, path_range.to),
-            |offset| thickness(offset, time),
-            max_thickness,
-        );
-
-        let canvas = rasterize(&model, &gradient, width, height);
-        let output = render(&canvas, true_color);
-
-        // Hide cursor while printing canvas to avoid flickering
-        print!("\x1B[?25l{}\x1B[?25h\n", output);
-
-        // Sleep to compensate for difference between rendering time and frame time
-        let sleep_time = (1.0 / fps) - (seconds(start_time.elapsed()) - time);
-        if sleep_time > 0.0 {
-            thread::sleep(Duration::new(sleep_time.trunc() as u64, (sleep_time.fract() * 1_000_000_000.0) as u32));
+        // Minimum and maximum length of the model, in blocks.
+        // The program will animate between the two for a "creeping" motion.
+        let length_range = unwrap_or_exit(arguments.value("length", Range::new(10.0, 20.0)));
+        if !(1.0 <= length_range.from && length_range.to <= 1000.0) {
+            exit!("Invalid length '{} to {}': Length must be between 1 and 1000.", length_range.from, length_range.to);
         }
 
-        // Move cursor up to enable drawing of next frame over the current one
-        print!("\x1B[{}A", height / 2);
+        // Coefficients of the function determining the model's thickness,
+        // in blocks.
+        //
+        // The function has the form
+        //
+        // ```
+        // f(o, t) = a + b * sin(PI * (c * o + d * t + e)) + ...
+        // ```
+        //
+        // where `o` is the offset (between `0` and `1`) from the head
+        // of the model to its tail, and `t` is the time in seconds
+        // since the program was started.
+        let coefficients = unwrap_or_exit(arguments.values("thickness", vec![4.0, 1.0, 3.5, 0.0, 0.0]));
+        if coefficients.len() % 4 != 1 {
+            exit!("Invalid thickness specification: There must be 1, or 5, or 9, ... coefficients; {} were supplied.",
+                    coefficients.len());
+        }
+
+        let thickness = |offset: f64, time: f64| {
+            assert!(0.0 <= offset && offset <= 1.0);
+            let mut thickness = coefficients[0];
+            for i in 0..((coefficients.len() - 1) / 4) {
+                thickness += coefficients[4 * i + 1] * (
+                    PI * (
+                        (coefficients[4 * i + 2] * offset) +
+                        (coefficients[4 * i + 3] * time) +
+                        coefficients[4 * i + 4]
+                    )
+                ).sin();
+            }
+            thickness
+        };
+
+        // Calculate upper bound for value of thickness function
+        let mut max_thickness = coefficients[0];
+        for i in 0..((coefficients.len() - 1) / 4) {
+            max_thickness += coefficients[4 * i + 1].abs();
+        }
+        if !(0.5 <= max_thickness && max_thickness <= 1000.0) {
+            exit!("Invalid thickness specification: Maximum thickness is {}; must be between 0.5 and 1000.", max_thickness);
+        }
+
+        let max_padding = 0.8 * ((min!(width, height) as f64) / 2.0);
+        // Minimum distance between the path and the boundary of the arena, in blocks
+        arg_var!(padding, min!(max_thickness, max_padding), 0.0, max_padding);
+
+        let max_radius = 0.8 * (((min!(width, height) as f64) / 2.0) - padding);
+        // Minimum and maximum radius of the arcs comprising the path, in blocks
+        let radius_range = unwrap_or_exit(arguments.value("radius",
+                Range::new(min!(1.2 * max_thickness, max_radius), max_radius)));
+        if !(0.5 <= radius_range.from && radius_range.to <= max_radius) {
+            if fit {
+                if term::too_small() { continue 'arena; } else { break 'arena; }
+            }
+            exit!("Invalid radius '{} to {}': For the configured width, height, and padding, \
+                    radius must be between 0.5 and {}.", radius_range.from, radius_range.to, max_radius);
+        }
+
+        // The dimensions of the arena must be such that it is always possible
+        // to generate a new arc that is tangential to the last arc in the path
+        // and whose radius lies within the permitted range (see `Path` for details).
+        // In the worst case, an arc of the maximum permitted radius is placed
+        // at the center of the arena, minimizing the available space for the next arc,
+        // which must be at least the minimum radius specified above.
+        let min_size = (2.0 * radius_range.to) + (4.0 * radius_range.from) + (2.0 * padding);
+        if (width as f64) < min_size && (height as f64) < min_size {
+            if fit {
+                if term::too_small() { continue 'arena; } else { break 'arena; }
+            }
+            exit!("Insufficient arena size for path generation: For the configured radius and padding, \
+                    either width or height must be at least {}.", min_size);
+        }
+
+        let mut path = Path {
+            random: Random(seed),
+            x_range: Range::new(padding, (width as f64) - padding),
+            y_range: Range::new(padding, (height as f64) - padding),
+            radius_range,
+            start_position: 0.0,
+            arcs: VecDeque::new(),
+        };
+
+        let mut last_position = 0.0;
+        let mut path_range = Range::new(0.0, length_range.from);
+        let mut expand_path = true;
+
+        let start_time = Instant::now();
+
+        if fit {
+            print!("\x1B[m\x1B[2J");
+        }
+
+        // Rendering loop
+        loop {
+            let time = seconds(start_time.elapsed());
+
+            let position = speed * time;
+
+            if length_range.to > length_range.from {
+                // "Creeping" motion
+                let mut delta = position - last_position;
+                last_position = position;
+
+                while delta > 0.0 {
+                    let length = path_range.to - path_range.from;
+
+                    let max_delta = if expand_path {
+                        length_range.to - length
+                    } else {
+                        length - length_range.from
+                    };
+
+                    let actual_delta = min!(delta, max_delta);
+
+                    if expand_path {
+                        path_range.to += actual_delta;
+                    } else {
+                        path_range.from += actual_delta;
+                    }
+
+                    if delta >= max_delta {
+                        expand_path = !expand_path;
+                    }
+
+                    delta -= actual_delta;
+                }
+            } else {
+                // Linear motion
+                path_range.from = position;
+                path_range.to = path_range.from + length_range.from;
+            }
+
+            let model = Model::new(
+                path.generate(path_range.from, path_range.to),
+                |offset| thickness(offset, time),
+                max_thickness,
+            );
+
+            let canvas = rasterize(&model, &gradient, width, height);
+            let output = render(&canvas, true_color);
+
+            if fit {
+                // Draw over the last frame from the top left corner
+                print!("\x1B[H{}", output);
+                let _ = io::stdout().flush();
+            } else {
+                // Hide cursor while printing canvas to avoid flickering
+                print!("\x1B[?25l{}\x1B[?25h\n", output);
+            }
+
+            // Sleep to compensate for difference between rendering time and frame time
+            let sleep_time = (1.0 / fps) - (seconds(start_time.elapsed()) - time);
+            if sleep_time > 0.0 {
+                thread::sleep(Duration::new(sleep_time.trunc() as u64, (sleep_time.fract() * 1_000_000_000.0) as u32));
+            }
+
+            if term::quitting() {
+                break 'arena;
+            }
+            if fit {
+                // Start again at the terminal's new size
+                if term::arena() != (width, height) {
+                    continue 'arena;
+                }
+            } else {
+                // Move cursor up to enable drawing of next frame over the current one
+                print!("\x1B[{}A", height / 2);
+            }
+        }
     }
+
+    term::restore();
 }
 
 
@@ -1212,4 +1257,305 @@ fn unwrap_or_exit<T, E: Display>(result: Result<T, E>) -> T {
 /// Returns the given duration, converted to (fractional) seconds.
 fn seconds(duration: Duration) -> f64 {
     (duration.as_secs() as f64) + ((duration.subsec_nanos() as f64) / 1_000_000_000.0)
+}
+
+
+//----------------------------------------------------------
+// Terminal (Asciiverse)
+//----------------------------------------------------------
+
+/// Keys and terminal size with the standard library alone: any key quits,
+/// and so do Ctrl+C, SIGTERM and SIGHUP, with the terminal put back the way
+/// it was found.
+mod term {
+    use std::io::{self, IsTerminal, Read, Write};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    static QUIT: AtomicBool = AtomicBool::new(false);
+    static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+    struct State {
+        saved: sys::Saved,
+        alternate: bool,
+    }
+
+    /// Reads keys in the background, and with `alternate` switches to the
+    /// terminal's alternate screen with the cursor hidden.
+    pub fn start(alternate: bool) {
+        sys::on_signals();
+        let keys = io::stdin().is_terminal();
+        let saved = sys::setup(keys);
+        if keys {
+            thread::spawn(|| {
+                let mut byte = [0u8; 1];
+                // At the end of input, keep running
+                if let Ok(1) = io::stdin().read(&mut byte) {
+                    QUIT.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+        if alternate {
+            print!("\x1B[?1049h\x1B[?25l");
+            let _ = io::stdout().flush();
+        }
+        *STATE.lock().unwrap() = Some(State { saved, alternate });
+    }
+
+    /// Puts the terminal back; safe to call more than once.
+    pub fn restore() {
+        let state = match STATE.lock() {
+            Ok(mut state) => state.take(),
+            Err(_) => None,
+        };
+        if let Some(state) = state {
+            print!("\x1B[m\x1B[?25h");
+            if state.alternate {
+                print!("\x1B[?1049l");
+            }
+            let _ = io::stdout().flush();
+            sys::restore(state.saved);
+        }
+    }
+
+    pub fn quitting() -> bool {
+        QUIT.load(Ordering::SeqCst)
+    }
+
+    /// The arena that fills the terminal, in blocks: one line holds two.
+    pub fn arena() -> (usize, usize) {
+        let (columns, lines) = sys::size().unwrap_or((60, 20));
+        (min!(columns, 500), min!(2 * lines, 500))
+    }
+
+    /// Says the window is too small, then waits until its size changes
+    /// (true) or a key is pressed (false).
+    pub fn too_small() -> bool {
+        let size = sys::size();
+        print!("\x1B[m\x1B[2J\x1B[HThe window is too small: make it larger, or press a key to quit.");
+        let _ = io::stdout().flush();
+        loop {
+            thread::sleep(Duration::from_millis(100));
+            if quitting() {
+                return false;
+            }
+            if sys::size() != size {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    mod sys {
+        use std::os::raw::{c_int, c_ulong};
+        use std::sync::atomic::Ordering;
+        use super::QUIT;
+
+        // struct termios, as the C libraries lay it out
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        mod c {
+            pub type Flag = u32;
+            pub const LFLAG: usize = 12;
+            pub const ISIG: Flag = 0o1;
+            pub const ICANON: Flag = 0o2;
+            pub const ECHO: Flag = 0o10;
+            pub const CC: usize = 17;
+            pub const VTIME: usize = 5;
+            pub const VMIN: usize = 6;
+            pub const TIOCGWINSZ: ::std::os::raw::c_ulong = 0x5413;
+        }
+        #[cfg(target_os = "macos")]
+        mod c {
+            pub type Flag = u64;
+            pub const LFLAG: usize = 24;
+            pub const ISIG: Flag = 0x80;
+            pub const ICANON: Flag = 0x100;
+            pub const ECHO: Flag = 0x8;
+            pub const CC: usize = 32;
+            pub const VMIN: usize = 16;
+            pub const VTIME: usize = 17;
+            pub const TIOCGWINSZ: ::std::os::raw::c_ulong = 0x40087468;
+        }
+
+        extern "C" {
+            fn tcgetattr(fd: c_int, termios: *mut u8) -> c_int;
+            fn tcsetattr(fd: c_int, action: c_int, termios: *const u8) -> c_int;
+            fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+            fn signal(signal: c_int, handler: extern "C" fn(c_int)) -> usize;
+        }
+
+        /// The terminal settings found at the start, if they were changed
+        pub struct Saved(Option<[u64; 16]>);
+
+        extern "C" fn on_signal(_: c_int) {
+            QUIT.store(true, Ordering::SeqCst);
+        }
+
+        pub fn on_signals() {
+            unsafe {
+                // SIGHUP, SIGINT, SIGTERM
+                for &number in &[1, 2, 15] {
+                    signal(number, on_signal);
+                }
+            }
+        }
+
+        /// Turns off echo and line editing, and Ctrl+C as a signal, so that
+        /// it arrives as a key like any other.
+        pub fn setup(keys: bool) -> Saved {
+            if !keys {
+                return Saved(None);
+            }
+            let mut termios = [0u64; 16];
+            unsafe {
+                let bytes = termios.as_mut_ptr() as *mut u8;
+                if tcgetattr(0, bytes) != 0 {
+                    return Saved(None);
+                }
+                let saved = termios;
+                let lflag = bytes.add(c::LFLAG) as *mut c::Flag;
+                *lflag &= !(c::ISIG | c::ICANON | c::ECHO);
+                *bytes.add(c::CC + c::VMIN) = 1;
+                *bytes.add(c::CC + c::VTIME) = 0;
+                if tcsetattr(0, 0, bytes) != 0 {
+                    return Saved(None);
+                }
+                Saved(Some(saved))
+            }
+        }
+
+        pub fn restore(saved: Saved) {
+            if let Some(termios) = saved.0 {
+                unsafe {
+                    tcsetattr(0, 0, termios.as_ptr() as *const u8);
+                }
+            }
+        }
+
+        /// Columns and lines
+        pub fn size() -> Option<(usize, usize)> {
+            let mut winsize = [0u16; 4];
+            let ok = unsafe { ioctl(1, c::TIOCGWINSZ, winsize.as_mut_ptr()) } == 0;
+            if ok && winsize[0] > 0 && winsize[1] > 0 {
+                Some((winsize[1] as usize, winsize[0] as usize))
+            } else {
+                None
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    mod sys {
+        use std::os::raw::c_void;
+        use std::sync::atomic::Ordering;
+        use super::QUIT;
+
+        type Handle = *mut c_void;
+        const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+        const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+        const ENABLE_PROCESSED_INPUT: u32 = 0x1;
+        const ENABLE_LINE_INPUT: u32 = 0x2;
+        const ENABLE_ECHO_INPUT: u32 = 0x4;
+        const ENABLE_PROCESSED_OUTPUT: u32 = 0x1;
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x4;
+
+        #[repr(C)]
+        struct ScreenBufferInfo {
+            size: [i16; 2],
+            cursor: [i16; 2],
+            attributes: u16,
+            window: [i16; 4],
+            maximum: [i16; 2],
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetStdHandle(which: u32) -> Handle;
+            fn GetConsoleMode(console: Handle, mode: *mut u32) -> i32;
+            fn SetConsoleMode(console: Handle, mode: u32) -> i32;
+            fn GetConsoleScreenBufferInfo(console: Handle, info: *mut ScreenBufferInfo) -> i32;
+            fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+        }
+
+        /// The console modes found at the start, if they were changed
+        pub struct Saved {
+            input: Option<u32>,
+            output: Option<u32>,
+        }
+
+        unsafe extern "system" fn on_control(_: u32) -> i32 {
+            QUIT.store(true, Ordering::SeqCst);
+            1
+        }
+
+        pub fn on_signals() {
+            unsafe {
+                SetConsoleCtrlHandler(Some(on_control), 1);
+            }
+        }
+
+        fn mode(which: u32) -> Option<(Handle, u32)> {
+            let console = unsafe { GetStdHandle(which) };
+            let mut mode = 0;
+            if unsafe { GetConsoleMode(console, &mut mode) } != 0 {
+                Some((console, mode))
+            } else {
+                None
+            }
+        }
+
+        /// Turns off echo, line editing and Ctrl+C handling on input, and
+        /// turns on escape sequences on output.
+        pub fn setup(keys: bool) -> Saved {
+            let mut saved = Saved { input: None, output: None };
+            if let Some((console, mode)) = mode(STD_OUTPUT_HANDLE) {
+                let vt = mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                if unsafe { SetConsoleMode(console, vt) } != 0 {
+                    saved.output = Some(mode);
+                }
+            }
+            if keys {
+                if let Some((console, mode)) = mode(STD_INPUT_HANDLE) {
+                    let raw = mode & !(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+                    if unsafe { SetConsoleMode(console, raw) } != 0 {
+                        saved.input = Some(mode);
+                    }
+                }
+            }
+            saved
+        }
+
+        pub fn restore(saved: Saved) {
+            unsafe {
+                if let Some(mode) = saved.input {
+                    SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode);
+                }
+                if let Some(mode) = saved.output {
+                    SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode);
+                }
+            }
+        }
+
+        /// Columns and lines of the visible window
+        pub fn size() -> Option<(usize, usize)> {
+            let mut info = ScreenBufferInfo { size: [0; 2], cursor: [0; 2], attributes: 0, window: [0; 4], maximum: [0; 2] };
+            if unsafe { GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) } == 0 {
+                return None;
+            }
+            let columns = (info.window[2] - info.window[0] + 1) as usize;
+            let lines = (info.window[3] - info.window[1] + 1) as usize;
+            Some((columns, lines))
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+    mod sys {
+        pub struct Saved;
+        pub fn on_signals() {}
+        pub fn setup(_: bool) -> Saved { Saved }
+        pub fn restore(_: Saved) {}
+        pub fn size() -> Option<(usize, usize)> { None }
+    }
 }
