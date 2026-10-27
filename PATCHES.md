@@ -61,3 +61,9 @@ av starts it as `ternimal fit=true`.
   120x40 draws again.
 - Windows and macOS: type-checked with rustc for x86_64-pc-windows-gnu and
   aarch64-apple-darwin; not run.
+
+## Ours
+
+- **How to play it, at the top of README.md.** A short note on installing and
+  starting it with av, or from a release archive; the original text follows
+  unchanged.

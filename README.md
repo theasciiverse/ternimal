@@ -1,3 +1,16 @@
+> **Play it with Asciiverse.** With [av](https://asciiverse.sh), the Asciiverse
+> client:
+>
+> ```
+> av install ternimal
+> av play ternimal
+> ```
+>
+> Or download the archive for your system from this repository's Releases,
+> unpack it and run `./ternimal` (`ternimal.exe` on Windows).
+>
+> The original README follows.
+
 <h1 align="center">Ternimal</h1>
 <h3 align="center">Simulate a lifeform in the terminal</h3>
 <br>
