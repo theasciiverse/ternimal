@@ -6,9 +6,6 @@
 > av play ternimal
 > ```
 >
-> Or download the archive for your system from this repository's Releases,
-> unpack it and run `./ternimal` (`ternimal.exe` on Windows).
->
 > The original README follows.
 
 <h1 align="center">Ternimal</h1>
